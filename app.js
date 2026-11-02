@@ -19,7 +19,9 @@
     playing: false, startTime: 0, elapsed: 0, currentGroup: 0, pendingNotes: new Set(),
     matchedNotes: new Set(), raf: 0, speed: 1, loop: false, audioContext: null,
     micStream: null, micFrame: 0, midiAccess: null, activeMidiInput: null, previousMicNote: null,
-    wrongTimer: 0, keyElements: new Map()
+    wrongTimer: 0, keyElements: new Map(), voices: new Set(), userVoices: new Map(),
+    playbackVoices: new Map(), heldInputs: new Map(), playbackEvents: [], playbackEventIndex: 0,
+    audioUnlockPromise: null
   };
   const ctx = els["note-canvas"].getContext("2d");
   const keyboardWidth = (countWhiteKeys() * WHITE_WIDTH);
@@ -45,6 +47,7 @@
       key.dataset.note = String(note);
       key.setAttribute("aria-label", noteName(note));
       key.title = noteName(note);
+      const pendingPointerUnlocks = new Set();
       if (WHITE_NOTES.has(pitchClass)) {
         key.style.left = `${whiteIndex * WHITE_WIDTH}px`;
         key.style.width = `${WHITE_WIDTH}px`;
@@ -64,27 +67,50 @@
         key.append(label);
       }
       key.addEventListener("pointerdown", event => {
-        event.preventDefault();
-        key.classList.add("pressed");
-        receiveNote(note, "tap");
+        const token = `pointer:${event.pointerId}`;
+        pendingPointerUnlocks.add(token);
+        holdInputNote(note, token);
+        void activateAudio().then(() => {
+          pendingPointerUnlocks.delete(token);
+          const held = state.heldInputs.get(note)?.size > 0;
+          const previous = state.userVoices.get(note);
+          if (previous) releaseVoice(previous);
+          const voice = startVoice(note);
+          if (!voice) return;
+          if (held) state.userVoices.set(note, voice);
+          else releaseVoice(voice, state.audioContext.currentTime + 0.18);
+        }).catch(showAudioError);
+        receiveNote(note);
       });
-      els["keyboard-scroll"].addEventListener("scroll", () => {
-        if (els["falling-wrap"].scrollLeft !== els["keyboard-scroll"].scrollLeft) {
-          els["falling-wrap"].scrollLeft = els["keyboard-scroll"].scrollLeft;
+      const releasePointer = event => {
+        const token = `pointer:${event.pointerId}`;
+        releaseInputNote(note, token);
+        if (!state.heldInputs.get(note)?.size && !pendingPointerUnlocks.has(token)) {
+          const voice = state.userVoices.get(note);
+          if (voice) releaseVoice(voice);
+          state.userVoices.delete(note);
         }
+      };
+      key.addEventListener("pointerup", releasePointer);
+      key.addEventListener("pointercancel", releasePointer);
+      key.addEventListener("pointerleave", event => {
+        if (event.buttons) releasePointer(event);
       });
-      els["falling-wrap"].addEventListener("scroll", () => {
-        if (els["keyboard-scroll"].scrollLeft !== els["falling-wrap"].scrollLeft) {
-          els["keyboard-scroll"].scrollLeft = els["falling-wrap"].scrollLeft;
-        }
-      });
-      key.addEventListener("pointerup", () => key.classList.remove("pressed"));
-      key.addEventListener("pointerleave", () => key.classList.remove("pressed"));
       fragment.append(key);
       state.keyElements.set(note, key);
     }
     els.keyboard.style.width = `${keyboardWidth}px`;
     els.keyboard.append(fragment);
+    els["keyboard-scroll"].addEventListener("scroll", () => {
+      if (els["falling-wrap"].scrollLeft !== els["keyboard-scroll"].scrollLeft) {
+        els["falling-wrap"].scrollLeft = els["keyboard-scroll"].scrollLeft;
+      }
+    });
+    els["falling-wrap"].addEventListener("scroll", () => {
+      if (els["keyboard-scroll"].scrollLeft !== els["falling-wrap"].scrollLeft) {
+        els["keyboard-scroll"].scrollLeft = els["falling-wrap"].scrollLeft;
+      }
+    });
     resizeCanvas();
   }
 
@@ -232,6 +258,187 @@
     els["connection-status"].classList.add("error");
   }
 
+  function showAudioError(error) {
+    showError(error instanceof Error
+      ? error.message
+      : "Не удалось включить звук. Нажми клавишу или кнопку воспроизведения и проверь настройки звука браузера.");
+  }
+
+  function activateAudio() {
+    if (state.audioContext?.state === "running") return Promise.resolve(state.audioContext);
+    if (state.audioUnlockPromise) return state.audioUnlockPromise;
+    state.audioUnlockPromise = (async () => {
+      const AudioContextConstructor = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextConstructor) {
+        throw new Error("Браузер не поддерживает Web Audio. Открой приложение в актуальном браузере, чтобы включить звук.");
+      }
+      if (!state.audioContext) {
+        state.audioContext = new AudioContextConstructor();
+        state.audioContext.addEventListener("statechange", () => {
+          if (state.audioContext.state !== "running" && state.playing && !document.hidden) {
+            showError("Звук приостановлен браузером. Нажми клавишу или «Начать», чтобы снова включить звук.");
+          }
+        });
+      }
+      try {
+        await state.audioContext.resume();
+      } catch (error) {
+        const reason = error instanceof Error && error.message ? ` (${error.message})` : "";
+        throw new Error(`Браузер заблокировал звук. Нажми клавишу или разреши воспроизведение звука в настройках сайта.${reason}`);
+      }
+      if (state.audioContext.state !== "running") {
+        throw new Error("Браузер не включил звук. Нажми клавишу или разреши воспроизведение звука в настройках сайта.");
+      }
+      els["connection-status"].classList.remove("error");
+      return state.audioContext;
+    })().finally(() => { state.audioUnlockPromise = null; });
+    return state.audioUnlockPromise;
+  }
+
+  function startVoice(note, velocity = 1, startAt) {
+    const audio = state.audioContext;
+    if (!audio || audio.state !== "running") return null;
+    const when = Math.max(audio.currentTime, startAt ?? audio.currentTime);
+    const frequency = 440 * 2 ** ((note - 69) / 12);
+    const envelope = audio.createGain();
+    const fundamental = audio.createOscillator();
+    const harmonic = audio.createOscillator();
+    const harmonicGain = audio.createGain();
+    const peak = Math.max(0.015, Math.min(0.18, 0.18 * velocity));
+
+    fundamental.type = "triangle";
+    fundamental.frequency.setValueAtTime(frequency, when);
+    harmonic.type = "sine";
+    harmonic.frequency.setValueAtTime(frequency * 2, when);
+    harmonicGain.gain.setValueAtTime(0.16, when);
+    envelope.gain.setValueAtTime(0.0001, when);
+    envelope.gain.linearRampToValueAtTime(peak, when + 0.012);
+    envelope.gain.exponentialRampToValueAtTime(peak * 0.48, when + 0.18);
+    fundamental.connect(envelope);
+    harmonic.connect(harmonicGain);
+    harmonicGain.connect(envelope);
+    envelope.connect(audio.destination);
+    const voice = { oscillators: [fundamental, harmonic], envelope, harmonicGain, released: false };
+    state.voices.add(voice);
+    fundamental.addEventListener("ended", () => {
+      fundamental.disconnect();
+      harmonic.disconnect();
+      harmonicGain.disconnect();
+      envelope.disconnect();
+      state.voices.delete(voice);
+    }, { once: true });
+    fundamental.start(when);
+    harmonic.start(when);
+    return voice;
+  }
+
+  function releaseVoice(voice, releaseAt) {
+    if (!voice || voice.released) return;
+    voice.released = true;
+    const audio = state.audioContext;
+    if (!audio) return;
+    const when = Math.max(audio.currentTime, releaseAt ?? audio.currentTime);
+    voice.envelope.gain.cancelScheduledValues(when);
+    voice.envelope.gain.setTargetAtTime(0.0001, when, 0.045);
+    voice.oscillators.forEach(oscillator => oscillator.stop(when + 0.2));
+  }
+
+  function holdInputNote(note, token) {
+    if (!state.heldInputs.has(note)) state.heldInputs.set(note, new Set());
+    state.heldInputs.get(note).add(token);
+    state.keyElements.get(note)?.classList.add("pressed");
+  }
+
+  function releaseInputNote(note, token) {
+    const inputs = state.heldInputs.get(note);
+    if (!inputs) return;
+    inputs.delete(token);
+    if (!inputs.size) {
+      state.heldInputs.delete(note);
+      state.keyElements.get(note)?.classList.remove("pressed");
+    }
+  }
+
+  function releaseUserNotes() {
+    for (const voice of state.userVoices.values()) releaseVoice(voice);
+    state.userVoices.clear();
+    for (const [pitch, tokens] of state.heldInputs) {
+      for (const token of tokens) releaseInputNote(pitch, token);
+    }
+    state.heldInputs.clear();
+  }
+
+  function releaseMidiNotes() {
+    for (const [pitch, tokens] of state.heldInputs) {
+      for (const token of tokens) {
+        if (token.startsWith("midi:")) releaseInputNote(pitch, token);
+      }
+      if (!state.heldInputs.get(pitch)?.size) {
+        const voice = state.userVoices.get(pitch);
+        if (voice) releaseVoice(voice);
+        state.userVoices.delete(pitch);
+      }
+    }
+  }
+
+  function stopPlaybackVoices() {
+    for (const voice of state.playbackVoices.values()) releaseVoice(voice);
+    state.playbackVoices.clear();
+    state.playbackEvents = [];
+    state.playbackEventIndex = 0;
+  }
+
+  function resetPlaybackAudio(time = state.elapsed) {
+    stopPlaybackVoices();
+    if (state.mode !== "listen" || !state.loaded) return;
+    const notes = visibleNotes();
+    for (const note of notes) {
+      if (note.start < time && note.end > time) {
+        const voice = startVoice(note.pitch, note.velocity / 127);
+        if (voice) state.playbackVoices.set(note, voice);
+      }
+    }
+    state.playbackEvents = notes.flatMap(note => [
+      { time: note.start, type: "on", note },
+      { time: note.end, type: "off", note }
+    ]).filter(event => event.time >= time)
+      .sort((a, b) => a.time - b.time || (a.type === b.type ? 0 : a.type === "on" ? -1 : 1));
+    state.playbackEventIndex = 0;
+  }
+
+  function syncPlaybackAudio(time) {
+    if (state.mode !== "listen" || !state.audioContext || state.audioContext.state !== "running") return;
+    while (state.playbackEventIndex < state.playbackEvents.length &&
+      state.playbackEvents[state.playbackEventIndex].time <= time) {
+      const event = state.playbackEvents[state.playbackEventIndex++];
+      if (event.type === "on") {
+        const voice = startVoice(event.note.pitch, event.note.velocity / 127);
+        if (!voice) continue;
+        if (event.note.end <= time) {
+          releaseVoice(voice, state.audioContext.currentTime + 0.05);
+        } else {
+          state.playbackVoices.set(event.note, voice);
+        }
+      } else {
+        const voice = state.playbackVoices.get(event.note);
+        if (voice) releaseVoice(voice);
+        state.playbackVoices.delete(event.note);
+      }
+    }
+  }
+
+  function updateSoundingKeys(time) {
+    const sounding = new Set();
+    if (state.mode === "listen") {
+      for (const note of visibleNotes()) {
+        if (note.start <= time && note.end > time) sounding.add(note.pitch);
+      }
+    }
+    for (const [pitch, key] of state.keyElements) {
+      key.classList.toggle("sounding", sounding.has(pitch));
+    }
+  }
+
   async function loadMidi(file) {
     if (!file) return;
     try {
@@ -262,7 +469,7 @@
       els["tempo-pill"].classList.add("ready");
       els["connection-status"].classList.remove("error");
       els["connection-status"].textContent = state.mode === "practice"
-        ? "Готово к практике. Нажми «Микрофон» или подключи MIDI-клавиатуру."
+        ? "Готово к практике. Нажимай клавиши здесь или подключи пианино."
         : "Песня загружена. Включи режим «Играть самому», чтобы ноты ждали тебя.";
       paintNotes();
     } catch (error) {
@@ -306,7 +513,7 @@
       const keyLeft = whitePos.get(note.pitch) ?? ((whitePos.get(note.pitch - 1) ?? 0) + WHITE_WIDTH * 0.66);
       const center = keyLeft + (WHITE_NOTES.has(note.pitch % 12) ? WHITE_WIDTH / 2 : WHITE_WIDTH * 0.72);
       const y = hitY - (distance / windowSeconds) * (height - 44);
-      const noteHeight = Math.max(9, Math.min(42, noteWidth * (0.65 + Math.min(note.end - note.start, 1))));
+      const noteHeight = Math.max(9, Math.min(height - 44, (note.end - note.start) / windowSeconds * (height - 44)));
       const isCurrent = state.mode === "practice" && state.pendingNotes.has(note.pitch) && state.currentGroup < state.groups.length && note.start === state.groups[state.currentGroup].start;
       ctx.fillStyle = note.hand === "left" ? (isCurrent ? "#a3f0f3" : "#6bcbe0") : (isCurrent ? "#e4d6ff" : "#ad94f4");
       ctx.globalAlpha = distance < 0 ? Math.max(.18, 1 + distance / 1.4) : .93;
@@ -324,11 +531,16 @@
   }
 
   function setMode(mode) {
+    if (state.playing && state.mode === "listen") {
+      state.elapsed = (performance.now() - state.startTime) * state.speed / 1000;
+    }
     state.mode = mode;
+    stopPlaybackVoices();
     if (state.playing && mode === "practice") {
       state.currentGroup = state.groups.findIndex(group => group.start >= state.elapsed);
       if (state.currentGroup < 0) state.currentGroup = state.groups.length;
       state.matchedNotes.clear();
+      state.pendingNotes.clear();
     }
     els["listen-mode"].classList.toggle("active", mode === "listen");
     els["practice-mode"].classList.toggle("active", mode === "practice");
@@ -336,14 +548,19 @@
     els["practice-mode"].setAttribute("aria-pressed", String(mode === "practice"));
     if (mode === "practice") {
       els["connection-status"].textContent = state.loaded
-        ? "Ноты будут ждать правильного звука с твоего инструмента."
+        ? "Ноты будут ждать правильного нажатия на клавиатуре или звука твоего инструмента."
         : "Сначала загрузи MIDI-файл, затем подключи микрофон или MIDI-клавиатуру.";
     } else {
       els["connection-status"].textContent = "В режиме прослушивания ноты идут по времени без ожидания.";
       state.matchedNotes.clear();
       clearExpectedKeys();
     }
+    if (state.playing && mode === "listen") {
+      state.startTime = performance.now() - state.elapsed * 1000 / state.speed;
+      resetPlaybackAudio(state.elapsed);
+    }
     paintNotes();
+    updateSoundingKeys(state.elapsed);
   }
 
   function rangeStart() {
@@ -356,33 +573,70 @@
     return Number.isFinite(value) ? Math.max(rangeStart(), Math.min(state.duration, value)) : state.duration;
   }
 
+  function updatePosition() {
+    els["position-current"].textContent = formatTime(state.elapsed);
+    els["progress-bar"].style.width = `${state.duration ? Math.min(100, state.elapsed / state.duration * 100) : 0}%`;
+  }
+
   function startPlayback() {
     if (!state.loaded) {
       showError("Сначала выбери MIDI-файл — без него нечего проигрывать.");
       return;
     }
-    stopPlayback();
+    stopPlaybackVoices();
+    if (state.elapsed >= rangeEnd()) state.elapsed = rangeStart();
+    state.elapsed = Math.max(rangeStart(), state.elapsed);
     state.playing = true;
-    const start = rangeStart();
-    state.elapsed = start;
-    state.startTime = performance.now() - start * 1000 / state.speed;
-    state.currentGroup = state.groups.findIndex(group => group.start >= start);
+    state.startTime = performance.now() - state.elapsed * 1000 / state.speed;
+    state.currentGroup = state.groups.findIndex(group => group.start >= state.elapsed);
     if (state.currentGroup < 0) state.currentGroup = state.groups.length;
     state.matchedNotes.clear();
+    state.pendingNotes.clear();
     els["play-icon"].textContent = "Ⅱ";
     els["play-label"].textContent = state.mode === "practice" ? "Пауза" : "Пауза";
     els["tempo-label"].textContent = state.mode === "practice" ? "Жду твою ноту" : "Играет";
+    resetPlaybackAudio(state.elapsed);
+    void activateAudio().then(() => {
+      if (state.playing && state.mode === "listen") resetPlaybackAudio(state.elapsed);
+    }).catch(showAudioError);
     state.raf = requestAnimationFrame(tick);
   }
 
-  function stopPlayback() {
+  function pausePlayback() {
+    if (state.playing && state.mode === "listen") {
+      state.elapsed = (performance.now() - state.startTime) * state.speed / 1000;
+    }
     state.playing = false;
     if (state.raf) cancelAnimationFrame(state.raf);
     state.raf = 0;
+    stopPlaybackVoices();
+    clearExpectedKeys();
+    els["play-icon"].textContent = "▶";
+    els["play-label"].textContent = "Продолжить";
+    if (state.loaded) els["tempo-label"].textContent = "Пауза";
+    updateSoundingKeys(-1);
+    paintNotes();
+  }
+
+  function stopPlayback(resetToStart = false) {
+    state.playing = false;
+    if (state.raf) cancelAnimationFrame(state.raf);
+    state.raf = 0;
+    stopPlaybackVoices();
     els["play-icon"].textContent = "▶";
     els["play-label"].textContent = "Начать";
     if (state.loaded) els["tempo-label"].textContent = "MIDI загружен";
+    if (resetToStart) {
+      state.elapsed = rangeStart();
+      state.currentGroup = state.groups.findIndex(group => group.start >= state.elapsed);
+      if (state.currentGroup < 0) state.currentGroup = state.groups.length;
+    }
+    state.pendingNotes.clear();
+    state.matchedNotes.clear();
     clearExpectedKeys();
+    updateSoundingKeys(-1);
+    updatePosition();
+    els["progress-bar"].style.width = `${state.duration ? state.elapsed / state.duration * 100 : 0}%`;
     paintNotes();
   }
 
@@ -390,6 +644,7 @@
     if (!state.playing) return;
     if (state.mode === "listen") {
       state.elapsed = (now - state.startTime) * state.speed / 1000;
+      syncPlaybackAudio(state.elapsed);
     } else if (state.currentGroup < state.groups.length) {
       state.elapsed = Math.max(0, state.groups[state.currentGroup].start - 0.65, state.elapsed);
       showExpectedGroup();
@@ -400,21 +655,23 @@
     const end = rangeEnd();
     if (state.elapsed >= end || (state.currentGroup >= state.groups.length && state.mode === "practice")) {
       if (state.loop && end > rangeStart()) {
+        stopPlaybackVoices();
         state.elapsed = rangeStart();
         state.startTime = now - state.elapsed * 1000 / state.speed;
         state.currentGroup = state.groups.findIndex(group => group.start >= state.elapsed);
         state.matchedNotes.clear();
+        state.pendingNotes.clear();
         clearExpectedKeys();
+        resetPlaybackAudio(state.elapsed);
       } else {
         state.elapsed = end;
         stopPlayback();
         return;
       }
     }
-    const progress = state.duration ? Math.min(100, state.elapsed / state.duration * 100) : 0;
-    els["progress-bar"].style.width = `${progress}%`;
-    els["position-current"].textContent = formatTime(state.elapsed);
+    updatePosition();
     paintNotes();
+    updateSoundingKeys(state.elapsed);
     state.raf = requestAnimationFrame(tick);
   }
 
@@ -427,7 +684,7 @@
       .map(note => note.pitch));
     for (const note of state.pendingNotes) {
       const element = state.keyElements.get(note);
-      if (element && !state.matchedNotes.has(note)) element.classList.add("expected");
+      if (element) element.classList.add("expected");
     }
     if (!state.pendingNotes.size) advanceGroup();
   }
@@ -437,6 +694,8 @@
   }
 
   function advanceGroup() {
+    clearExpectedKeys();
+    state.pendingNotes.clear();
     state.matchedNotes.clear();
     state.currentGroup++;
     if (state.currentGroup < state.groups.length) {
@@ -449,11 +708,8 @@
     }, 750);
   }
 
-  function receiveNote(note, source) {
-    if (!state.playing || state.mode !== "practice" || !state.loaded) {
-      if (source !== "mic") return;
-      return;
-    }
+  function receiveNote(note) {
+    if (!state.playing || state.mode !== "practice" || !state.loaded) return;
     const group = state.groups[state.currentGroup];
     if (!group) return;
     const expected = [...new Set(group.notes.filter(item => state.hand === "both" || item.hand === state.hand).map(item => item.pitch))];
@@ -470,12 +726,6 @@
     }
     if (state.matchedNotes.has(note)) return;
     state.matchedNotes.add(note);
-    const key = state.keyElements.get(note);
-    if (key) {
-      key.classList.add("pressed");
-      window.setTimeout(() => key.classList.remove("pressed"), 180);
-      key.classList.remove("expected");
-    }
     if (expected.every(pitch => state.matchedNotes.has(pitch))) advanceGroup();
   }
 
@@ -494,9 +744,9 @@
       return;
     }
     try {
+      const audioPromise = activateAudio();
       state.micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-      state.audioContext = state.audioContext || new (window.AudioContext || window.webkitAudioContext)();
-      await state.audioContext.resume();
+      await audioPromise;
       const source = state.audioContext.createMediaStreamSource(state.micStream);
       const analyser = state.audioContext.createAnalyser();
       analyser.fftSize = 4096;
@@ -515,7 +765,7 @@
           const midiNote = Math.round(69 + 12 * Math.log2(pitch / 440));
           if (midiNote !== state.previousMicNote) {
             state.previousMicNote = midiNote;
-            receiveNote(midiNote, "mic");
+            receiveNote(midiNote);
           }
         } else {
           state.previousMicNote = null;
@@ -524,10 +774,11 @@
       };
       listen();
     } catch (error) {
+      if (state.micStream) state.micStream.getTracks().forEach(track => track.stop());
       state.micStream = null;
       showError(error && error.name === "NotAllowedError"
         ? "Нет доступа к микрофону. Разреши его в настройках браузера или подключи MIDI-клавиатуру."
-        : "Не удалось подключить микрофон. Проверь разрешения браузера.");
+        : error instanceof Error ? error.message : "Не удалось подключить микрофон. Проверь разрешения браузера.");
     }
   }
 
@@ -556,17 +807,42 @@
       return;
     }
     try {
+      const audioPromise = activateAudio();
       state.midiAccess = await navigator.requestMIDIAccess();
+      await audioPromise;
       const inputs = Array.from(state.midiAccess.inputs.values());
       if (!inputs.length) {
         showError("MIDI-клавиатура не найдена. Подключи её и попробуй снова, либо используй микрофон.");
         return;
       }
-      if (state.activeMidiInput) state.activeMidiInput.onmidimessage = null;
+      if (state.activeMidiInput) {
+        state.activeMidiInput.onmidimessage = null;
+        releaseMidiNotes();
+      }
       state.activeMidiInput = inputs[0];
       state.activeMidiInput.onmidimessage = event => {
         const [status, pitch, velocity] = event.data;
-        if ((status & 0xf0) === 0x90 && velocity > 0) receiveNote(pitch, "midi");
+        const command = status & 0xf0;
+        const channel = status & 0x0f;
+        const token = `midi:${channel}:${pitch}`;
+        if (command === 0x90 && velocity > 0) {
+          holdInputNote(pitch, token);
+          void activateAudio().then(() => {
+            if (!state.heldInputs.get(pitch)?.has(token)) return;
+            const previous = state.userVoices.get(pitch);
+            if (previous) releaseVoice(previous);
+            const voice = startVoice(pitch, velocity / 127);
+            if (voice) state.userVoices.set(pitch, voice);
+          }).catch(showAudioError);
+          receiveNote(pitch);
+        } else if (command === 0x80 || command === 0x90 && velocity === 0) {
+          releaseInputNote(pitch, token);
+          if (!state.heldInputs.get(pitch)?.size) {
+            const voice = state.userVoices.get(pitch);
+            if (voice) releaseVoice(voice);
+            state.userVoices.delete(pitch);
+          }
+        }
       };
       els["device-button"].classList.add("active");
       els["connection-status"].classList.remove("error");
@@ -575,13 +851,14 @@
         if (state.activeMidiInput && state.activeMidiInput.state !== "connected") {
           els["device-button"].classList.remove("active");
           els["connection-status"].textContent = "MIDI-клавиатура отключена.";
+          releaseMidiNotes();
           state.activeMidiInput = null;
         }
       };
     } catch (error) {
       showError(error && error.name === "SecurityError"
         ? "Web MIDI доступен в поддерживаемом браузере по HTTPS."
-        : "Не удалось подключить MIDI-клавиатуру. Проверь разрешение браузера.");
+        : error instanceof Error ? error.message : "Не удалось подключить MIDI-клавиатуру. Проверь разрешение браузера.");
     }
   }
 
@@ -596,7 +873,12 @@
       group.notes.some(note => hand === "both" || note.hand === hand));
     if (state.currentGroup < 0) state.currentGroup = state.groups.length;
     state.matchedNotes.clear();
+    state.pendingNotes.clear();
+    clearExpectedKeys();
+    if (state.playing && state.mode === "practice") showExpectedGroup();
+    if (state.playing && state.mode === "listen") resetPlaybackAudio(state.elapsed);
     paintNotes();
+    updateSoundingKeys(state.elapsed);
   }
 
   els["import-button"].addEventListener("click", () => els["midi-file"].click());
@@ -605,36 +887,76 @@
   els["listen-mode"].addEventListener("click", () => setMode("listen"));
   els["practice-mode"].addEventListener("click", () => setMode("practice"));
   document.querySelectorAll(".hand-button").forEach(button => button.addEventListener("click", () => updateHand(button.dataset.hand)));
-  els["play-button"].addEventListener("click", () => state.playing ? stopPlayback() : startPlayback());
+  els["play-button"].addEventListener("click", () => state.playing ? pausePlayback() : startPlayback());
   els["restart-button"].addEventListener("click", () => {
     if (state.loaded) els["range-start"].value = "0";
     state.elapsed = 0;
     state.currentGroup = 0;
     state.matchedNotes.clear();
+    state.pendingNotes.clear();
+    clearExpectedKeys();
     if (state.playing) startPlayback();
     else {
+      stopPlaybackVoices();
       els["position-current"].textContent = "0:00";
       els["progress-bar"].style.width = "0%";
       paintNotes();
+      updateSoundingKeys(0);
     }
   });
-  els["stop-button"].addEventListener("click", stopPlayback);
+  els["stop-button"].addEventListener("click", () => stopPlayback(true));
   els["speed-control"].addEventListener("input", event => {
+    if (state.playing && state.mode === "listen") {
+      state.elapsed = (performance.now() - state.startTime) * state.speed / 1000;
+    }
     state.speed = Number(event.target.value);
     els["speed-label"].textContent = `${state.speed.toFixed(2).replace(/0$/, "").replace(/\.$/, "")}×`;
-    if (state.playing && state.mode === "listen") state.startTime = performance.now() - state.elapsed * 1000 / state.speed;
+    if (state.playing && state.mode === "listen") {
+      state.startTime = performance.now() - state.elapsed * 1000 / state.speed;
+      resetPlaybackAudio(state.elapsed);
+    }
     paintNotes();
+    updateSoundingKeys(state.elapsed);
   });
   els["range-start"].addEventListener("change", () => {
     const start = Math.min(Number(els["range-start"].value) || 0, Number(els["range-end"].value) || state.duration);
     els["range-start"].value = String(start);
-    if (state.elapsed < start) state.elapsed = start;
+    if (state.elapsed < start) {
+      state.elapsed = start;
+      if (state.playing && state.mode === "listen") {
+        state.startTime = performance.now() - state.elapsed * 1000 / state.speed;
+        resetPlaybackAudio(state.elapsed);
+      } else if (state.playing) {
+        state.currentGroup = state.groups.findIndex(group => group.start >= start);
+        if (state.currentGroup < 0) state.currentGroup = state.groups.length;
+        state.matchedNotes.clear();
+        state.pendingNotes.clear();
+      }
+      updateSoundingKeys(state.elapsed);
+    }
+    updatePosition();
+    paintNotes();
   });
   els["range-end"].addEventListener("change", () => {
     const raw = els["range-end"].value.trim();
     const value = raw === "" ? state.duration : Number(raw);
     const end = Math.max(rangeStart(), Math.min(state.duration, Number.isFinite(value) ? value : state.duration));
     els["range-end"].value = String(end);
+    if (state.elapsed > end) {
+      state.elapsed = end;
+      if (state.playing && state.mode === "listen") {
+        state.startTime = performance.now() - state.elapsed * 1000 / state.speed;
+        resetPlaybackAudio(state.elapsed);
+      } else if (state.playing) {
+        state.currentGroup = state.groups.findIndex(group => group.start >= end);
+        if (state.currentGroup < 0) state.currentGroup = state.groups.length;
+        state.matchedNotes.clear();
+        state.pendingNotes.clear();
+      }
+      updateSoundingKeys(state.elapsed);
+    }
+    updatePosition();
+    paintNotes();
   });
   els["loop-toggle"].addEventListener("change", event => { state.loop = event.target.checked; });
   els["microphone-button"].addEventListener("click", connectMicrophone);
@@ -644,8 +966,19 @@
     if (event.key === "ArrowLeft") els["keyboard-scroll"].scrollLeft -= 80;
   });
   window.addEventListener("resize", resizeCanvas);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      if (state.playing) pausePlayback();
+      releaseUserNotes();
+      if (state.audioContext?.state === "running" && typeof state.audioContext.suspend === "function") {
+        void state.audioContext.suspend().catch(showAudioError);
+      }
+    }
+  });
   window.addEventListener("beforeunload", () => {
     if (state.micStream) state.micStream.getTracks().forEach(track => track.stop());
+    stopPlaybackVoices();
+    releaseUserNotes();
   });
   renderKeyboard();
 })();
