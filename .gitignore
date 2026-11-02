@@ -1,0 +1,11 @@
+/*
+!/.gitignore
+!/index.html
+!/styles.css
+!/app.js
+!/README.md
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/pages.yml

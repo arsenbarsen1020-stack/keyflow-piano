@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#11131b">
+    <meta name="description" content="Интерактивная практика игры на пианино с MIDI-файлами, микрофоном и MIDI-клавиатурой.">
+    <title>Keyflow — практика на пианино</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="Keyflow — главная">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <span>keyflow</span>
+        </a>
+        <div class="topbar-note"><span class="live-dot"></span> Твоя музыкальная практика</div>
+        <a class="top-link" href="#how-it-works">Как это работает <span aria-hidden="true">↗</span></a>
+      </header>
+
+      <section class="lesson-heading">
+        <div class="eyebrow"><span class="eyebrow-line"></span> ТВОЯ СЕССИЯ</div>
+        <div class="heading-row">
+          <div>
+            <h1 id="song-title">Drawing Love Reimagined</h1>
+            <p class="subtitle" id="song-subtitle">Загрузи свой MIDI — и сыграй песню шаг за шагом</p>
+          </div>
+          <button class="import-button" id="import-button" type="button">
+            <span class="upload-icon" aria-hidden="true">↑</span>
+            <span>Импортировать MIDI</span>
+          </button>
+          <input id="midi-file" type="file" accept=".mid,.midi,audio/midi,audio/x-midi" hidden>
+        </div>
+      </section>
+
+      <section class="studio-card" aria-label="Пиано-тренажёр">
+        <div class="studio-toolbar">
+          <div class="mode-switch" role="group" aria-label="Режим воспроизведения">
+            <button class="mode-button active" id="listen-mode" type="button" aria-pressed="true">
+              <span class="mode-icon" aria-hidden="true">▶</span> Слушать
+            </button>
+            <button class="mode-button" id="practice-mode" type="button" aria-pressed="false">
+              <span class="mode-icon headphones" aria-hidden="true">◉</span> Играть самому
+            </button>
+          </div>
+          <div class="hands-switch" role="group" aria-label="Выбор рук">
+            <span class="switch-label">РУКА</span>
+            <button class="hand-button active" data-hand="both" type="button" aria-pressed="true">Обе</button>
+            <button class="hand-button" data-hand="right" type="button" aria-pressed="false">Правая</button>
+            <button class="hand-button" data-hand="left" type="button" aria-pressed="false">Левая</button>
+          </div>
+        </div>
+
+        <div class="score-row">
+          <div class="score-copy">
+            <span class="score-kicker">ПРОГРЕСС УРОКА</span>
+            <span class="score-value" id="progress-label">Добавь MIDI, чтобы начать</span>
+          </div>
+          <div class="progress-track" aria-label="Прогресс"><span id="progress-bar"></span></div>
+          <div class="tempo-pill" id="tempo-pill"><span class="tempo-dot"></span><span id="tempo-label">Ожидание MIDI</span></div>
+        </div>
+
+        <div class="falling-wrap" id="falling-wrap">
+          <div class="empty-state" id="empty-state">
+            <div class="empty-note" aria-hidden="true">♪</div>
+            <strong>Твоя песня начнётся здесь</strong>
+            <span>Загрузи MIDI-файл — ноты появятся над клавишами</span>
+            <button class="empty-import" type="button" id="empty-import">Выбрать MIDI-файл <span>→</span></button>
+          </div>
+          <div class="falling-inner" id="falling-inner" hidden>
+            <canvas id="note-canvas" aria-label="Падающие ноты песни"></canvas>
+            <div class="hit-line"></div>
+          </div>
+          <div class="falling-caption" id="falling-caption" hidden><span class="legend-swatch right-swatch"></span> Правая <span class="legend-swatch left-swatch"></span> Левая</div>
+        </div>
+
+        <div class="keyboard-heading">
+          <span>КЛАВИАТУРА <span class="key-count">88 клавиш</span></span>
+          <span class="keyboard-hint">Нажми клавишу или подключи инструмент <span aria-hidden="true">↓</span></span>
+        </div>
+        <div class="keyboard-scroll" id="keyboard-scroll" tabindex="0" aria-label="Прокручиваемая клавиатура пианино">
+          <div class="keyboard" id="keyboard"></div>
+        </div>
+
+        <div class="transport">
+          <div class="transport-actions">
+            <button class="round-control" id="restart-button" type="button" aria-label="Вернуться к началу" title="К началу">↶</button>
+            <button class="play-button" id="play-button" type="button" aria-label="Начать">
+              <span id="play-icon" aria-hidden="true">▶</span><span id="play-label">Начать</span>
+            </button>
+            <button class="round-control" id="stop-button" type="button" aria-label="Остановить" title="Остановить">■</button>
+          </div>
+          <div class="position-label"><span id="position-current">0:00</span><span class="position-divider">/</span><span id="position-total">0:00</span></div>
+          <div class="volume-control"><span aria-hidden="true">♫</span><input id="speed-control" type="range" min="0.5" max="1.5" step="0.05" value="1" aria-label="Скорость падения нот"><span id="speed-label">1×</span></div>
+        </div>
+
+        <div class="practice-panel">
+          <div class="practice-title"><span class="loop-icon" aria-hidden="true">↻</span><div><strong>Отрезок для практики</strong><small>Зацикли выбранную часть песни</small></div></div>
+          <div class="range-control">
+            <label>С <input id="range-start" type="number" min="0" step="0.1" value="0" disabled><span>сек</span></label>
+            <span class="range-dash">—</span>
+            <label>По <input id="range-end" type="number" min="0" step="0.1" value="0" disabled><span>сек</span></label>
+          </div>
+          <label class="loop-toggle"><input id="loop-toggle" type="checkbox" disabled><span class="toggle-track"></span><span>Повторять отрезок</span></label>
+        </div>
+      </section>
+
+      <section class="connection-card" aria-label="Подключение пианино">
+        <div class="connection-intro">
+          <div class="connection-icon" aria-hidden="true">⌁</div>
+          <div><strong>Слушаем твоё пианино</strong><p id="connection-status">Подключи инструмент, чтобы приложение проверяло каждую ноту</p></div>
+        </div>
+        <div class="connection-actions">
+          <button class="connect-button" id="microphone-button" type="button"><span aria-hidden="true">◉</span> Микрофон</button>
+          <button class="connect-button midi-connect" id="device-button" type="button"><span aria-hidden="true">⌨</span> MIDI-клавиатура</button>
+        </div>
+      </section>
+
+      <section class="how-it-works" id="how-it-works">
+        <span class="how-label">ПРОСТО НАЧАТЬ</span>
+        <div class="steps">
+          <div class="step"><span class="step-number">01</span><div><strong>Загрузи песню</strong><p>Импортируй MIDI-файл со своего устройства</p></div></div>
+          <div class="step"><span class="step-number">02</span><div><strong>Выбери руку</strong><p>Тренируй правую, левую или обе руки</p></div></div>
+          <div class="step"><span class="step-number">03</span><div><strong>Играй в своём темпе</strong><p>В режиме практики ноты ждут твоего ответа</p></div></div>
+        </div>
+      </section>
+      <footer>Твои MIDI-файлы обрабатываются прямо в браузере и никуда не отправляются.</footer>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
